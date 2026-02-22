@@ -1,22 +1,26 @@
 # Vassal-Drawing
-Video demonstration: https://youtu.be/WIi4VKT9eQQ
+Video demonstration: https://youtu.be/c_-kEHwLE4I
 
-As I began designing modules, I quickly ran into trouble trying to make some sheets customizable, so I decided to try creating an external class to enable drawing. In order to do that I’ve created a transparent piece as large as the map, then used scripting to treat it as a screen, so the only hard part was creating a simple paint software for that (thanks GPT5.2, I don’t know Java).
+As I began designing modules, I quickly ran into trouble trying to make some sheets customizable, so I decided to try creating an external class to enable drawing. In 1.0, I used a transparent piece on which an outside script could draw thanks to a simple drawing program (written by GPT5.2, I don't know Java). For 2.0, following the advice of cholmcc, I used a map overlay (written instead by Gemini3.1) and I added complete SVG usage.
 
-## Setup guide and tutorial
-Right now, if you want to try it out on one of your modules:
- - Take the drawing folder and put it in the main directory of the vmod file.
- - Modify the buildFile.xml (in the vmod file) on one of the first lines (“<VASSAL.build.module.BasicCommandEncoder/>”) so that it becomes “<drawing.DrawingCommandEncoder/>”
- - Create a transparent piece as large as the map and put it in an At-Start-Stack in the middle of the map.
- - Add the Does Not Stack trait with Move=NEVER.
- - Import the “drawing.DrawingLayer” class.
- - Put it as a trait. You can set up Draw/Text color RGB, line thickness, gum radius, text font and text size.
+## Installation instructions:
+ - Open your .vmod with a zip editor and drop the 'drawing' folder inside.
+ - When in the VASSAL Editor, right-click your Map, select 'Add Imported Class', and type 'drawing.MapAnnotator'.
 
-This will give you the minimum setup, that is, CTRL+D to enter Draw mode, CTRL+T to enter Text mode, ESC to leave any mode. Use LMB to draw/create a text box/edit a created text box. Hold down CTRL and use LMB to erase text/drawing. Note: I highly suggest to use only the draw’s eraser function, as the text’s eraser is laggy and doesn’t work on drawing, while the draw’s eraser works on both.
+After you've installed the script, you can edit RGB for text and drawings, change buttons' names and create custom shortcuts for the different functions.
 
-In order to add buttons I’ve used the GumLatch Dynamic Property, which speaks directly with the Java class, to toggle a virtual CTRL on/off, while the rest is just some work with Global Key Commands and Global Properties.
+## Usage instructions:
+ - LMB on any button to select that function.
+ - Hold LMB to draw or use the gum (when selected).
+ - LMB once to write text (when selected).
+ - RMB once on Shapes to open the shape selector (LMB on the desired shape to mark as favourite).
+ - Hold LMB to start creating a shape, release LMB to create it.
+ - LMB once on created text to edit.
 
-If you want to try my implementation, download the "Raider!" module from Vassal (https://vassalengine.org/library/projects/raider_sovietviper) and open a vessels' tab.
+Enjoy!
 
-## "Roadmap"
-Following the suggestions of cholmcc (https://forum.vassalengine.org/u/cholmcc/summary) I'll try to create a sub-element for a map instead of a trait for a piece.
+## Notes for editors:
+The software is not optimized in any way, so the gum tends to lag quite a lot. I'm pretty sure there's a way to make it flawless, while still keeping all deleting functionalities. Custom button icons are also missing. 
+For the future it would be great to make text interact with the Vassal module (for example, showing global variables), and to make users add custom shapes easily.
+
+Thanks again to cholmcc (https://forum.vassalengine.org/u/cholmcc/summary) for giving suggestions on how to improve the original 1.0 script.
