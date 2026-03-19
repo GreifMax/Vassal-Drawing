@@ -20,7 +20,7 @@ After you've installed the script, you can edit RGB for text and drawings, chang
 Enjoy!
 
 ## Notes for editors:
-The software is not optimized in any way, so the gum tends to lag quite a lot. I'm pretty sure there's a way to make it flawless, while still keeping all deleting functionalities. Custom button icons are also missing. 
+The software is not optimized in any way and custom button icons are missing. 
 For the future it would be great to make text interact with the Vassal module (for example, showing global variables), and to make users add custom shapes easily.
 
 Thanks again to cholmcc (https://forum.vassalengine.org/u/cholmcc/summary) for giving suggestions on how to improve the original 1.0 script.
