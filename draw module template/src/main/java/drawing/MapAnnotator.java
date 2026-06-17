@@ -67,6 +67,12 @@ public class MapAnnotator extends AbstractConfigurable
     private transient boolean gumWorkScheduled = false;
     private int gumWorkBudgetMs = 6;
 
+    // Whether this annotator currently owns the map's mouseListenerStack slot.
+    // We push ourselves onto the stack ONLY while a drawing mode is active,
+    // so that normal piece selection / dragging keeps working while OFF.
+    // See updateStackMembership() and the note in addTo().
+    private transient boolean listenerOnStack = false;
+
     // Flattening tolerance (map units) for curve->polyline conversion in eraser math
     private static final double ERASE_FLATNESS = 0.75;
 
@@ -429,7 +435,11 @@ public class MapAnnotator extends AbstractConfigurable
     public void removeFrom(Buildable parent) {
         if (map != null) {
             map.removeDrawComponent(this);
-            map.popMouseListener(this);
+            // Only pop the stack if we actually own the slot right now.
+            if (listenerOnStack) {
+                map.popMouseListener(this);
+                listenerOnStack = false;
+            }
             if (map.getView() != null) map.getView().removeMouseMotionListener(this);
 
             if (btnDraw != null) map.getToolBar().remove(btnDraw);
@@ -440,6 +450,7 @@ public class MapAnnotator extends AbstractConfigurable
         }
         GameModule.getGameModule().removeCommandEncoder(this);
         GameModule.getGameModule().getGameState().removeGameComponent(this);
+        mode = Mode.OFF;
     }
 
     @Override
@@ -453,8 +464,24 @@ public class MapAnnotator extends AbstractConfigurable
 
             SwingUtilities.invokeLater(() -> {
                 if (map != null && map.getView() != null) {
-                    map.pushMouseListener(this);
+                    // IMPORTANT: We intentionally do NOT call map.pushMouseListener(this)
+                    // here. VASSAL's Map.mousePressed/mouseReleased/mouseClicked dispatch
+                    // EXCLUSIVELY to the top of the mouseListenerStack (it is an
+                    // if/else-if with the normal local-mouse-listener multicaster), and
+                    // the piece-drag DragGestureListener is only recognised while the
+                    // stack is empty (see Map.addTo's DragGestureListener guard:
+                    // `mouseListenerStack.isEmpty()`). Permanently occupying the stack
+                    // would therefore prevent users from ever selecting or moving tokens.
+                    //
+                    // Instead we push/pop ourselves on demand in setMode() (via
+                    // updateStackMembership()) whenever a drawing tool is toggled on/off.
+                    // While Mode == OFF the stack is empty and the engine handles mouse
+                    // input normally; while a tool is active we own the mouse events for
+                    // drawing. We still keep the MouseMotionListener attached full-time
+                    // (it is harmless: Map does not route motion events through the
+                    // stack, and it early-returns when OFF).
                     map.getView().addMouseMotionListener(this);
+                    updateStackMembership();
                 }
             });
         }
@@ -555,7 +582,42 @@ public class MapAnnotator extends AbstractConfigurable
         shapeStart = null;
         previewPaths = null;
         previewTexts = null;
+
+        // Take / release the map's mouseListenerStack depending on whether a
+        // drawing mode is active. While active we own mousePressed/Released/
+        // Clicked (so the engine won't try to select/drag pieces underneath
+        // our strokes); while OFF the stack is empty and the engine is free
+        // to read mouse input normally -- this is what lets users move tokens.
+        updateStackMembership();
+
         if (map != null) map.repaint();
+    }
+
+    /**
+     * Ensures this annotator is pushed onto the map's mouseListenerStack iff a
+     * drawing mode is active.
+     *
+     * VASSAL's {@link Map} dispatches mousePressed / mouseReleased / mouseClicked
+     * to the TOP of the mouseListenerStack only (it is an if/else-if against the
+     * normal local-mouse-listener multicaster), and its piece-drag
+     * DragGestureListener is suppressed whenever the stack is non-empty
+     * (see the `mouseListenerStack.isEmpty()` guard in Map.addTo).
+     *
+     * Therefore we must occupy the stack ONLY while drawing. This is exactly
+     * what restores the ability to select and move tokens whenever no draw
+     * tool is enabled.
+     */
+    private void updateStackMembership() {
+        if (map == null) return;
+        final boolean wantOnStack = (mode != Mode.OFF);
+        if (wantOnStack && !listenerOnStack) {
+            map.pushMouseListener(this);
+            listenerOnStack = true;
+        }
+        else if (!wantOnStack && listenerOnStack) {
+            map.popMouseListener(this);
+            listenerOnStack = false;
+        }
     }
 
     // ------------------- Mouse Listener -------------------
@@ -669,7 +731,10 @@ public class MapAnnotator extends AbstractConfigurable
 
     @Override
     public void mouseMoved(MouseEvent e) {
-        if (map == null) return;
+        // When OFF, stay completely out of the engine's way -- do not track the
+        // cursor or trigger repaints. (This listener is attached to the map view
+        // full-time via addMouseMotionListener; it must be inert while OFF.)
+        if (map == null || mode == Mode.OFF) return;
         cursorMap = map.componentToMap(e.getPoint());
 
         // TEXT preview follows cursor
