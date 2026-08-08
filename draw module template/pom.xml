@@ -1,0 +1,129 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- name and version of the module -->
+  <groupId>NameOfModule</groupId>
+  <artifactId>VassalDraw</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+
+  <properties>
+    <!-- set Vassal version here -->
+    <vassal.version>3.7.5</vassal.version>
+
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.vassalengine</groupId>
+      <artifactId>vassal-app</artifactId>
+      <version>${vassal.version}</version>
+    </dependency>
+
+    <!-- Add module dependencies which  are not part of Vassal here -->
+    <dependency>
+      <groupId>org.jdom</groupId>
+      <artifactId>jdom2</artifactId>
+      <version>2.0.5</version>
+    </dependency>
+  </dependencies>
+
+  <repositories>
+    <repository>
+      <id>vassal-releases</id>
+      <url>https://vassalengine.org/maven</url>
+    </repository>
+  </repositories>
+
+  <build>
+    <sourceDirectory>src</sourceDirectory>
+
+    <!-- bundle files in dist/ into the module -->
+    <resources>
+      <!-- replace variables (e.g., ${project.version} in these files -->
+      <resource>
+        <directory>dist</directory>
+        <filtering>true</filtering>
+        <includes>
+          <include>buildFile.xml</include>
+          <include>moduledata</include>
+        </includes>
+      </resource>
+
+      <!-- don't replace variables in these files -->
+      <resource>
+        <directory>dist</directory>
+        <filtering>false</filtering>
+        <excludes>
+          <exclude>buildFile.xml</exclude>
+          <exclude>moduledata</exclude>
+        </excludes>
+      </resource>
+    </resources>
+
+    <plugins>
+      <plugin>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <showDeprecation>true</showDeprecation>
+          <!-- Vassal requires compiling for Java 11 compatibility -->
+          <release>11</release>
+        </configuration>
+      </plugin>
+
+       <!--
+           Uncomment the maven-shade-plugin to copy Java dependencies listed
+           above in a <dependency> section into the module. Dependencies must
+           be listed again in the <includes> section here to be packaged into
+           the module. DO NOT enable the maven-shade-plugin without at least
+           one dependency listed in <includes>.
+       -->
+<!--
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <artifactSet>
+                <includes>
+                  <include>org.jdom:jdom2</include>
+                </includes>
+              </artifactSet>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+-->
+
+      <!-- copy the .jar file maven packages to .vmod -->
+      <plugin>
+        <groupId>com.coderplus.maven.plugins</groupId>
+        <artifactId>copy-rename-maven-plugin</artifactId>
+        <version>1.0</version>
+        <executions>
+          <execution>
+            <id>rename-file</id>
+            <phase>package</phase>
+            <goals>
+              <goal>rename</goal>
+            </goals>
+            <configuration>
+              <sourceFile>${project.build.directory}/${project.build.finalName}.jar</sourceFile>
+              <destinationFile>${project.build.directory}/${project.build.finalName}.vmod</destinationFile>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+    </plugins>
+  </build>
+</project>
