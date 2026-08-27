@@ -428,9 +428,13 @@ public class MapAnnotator extends AbstractConfigurable
         final String name;
         final SvgPath template;
         final double normMinX, normMinY, normW, normH;
+        // Placement style: false = Box (corner-to-corner, screen-aligned),
+        // true = Directed (tail at p1, head at p2, rotated/scaled along the vector)
+        final boolean directed;
 
-        CustomShape(String name, String svgData) {
+        CustomShape(String name, String svgData, boolean directed) {
             this.name = name;
+            this.directed = directed;
             this.template = new SvgPath(UUID.randomUUID().toString(), 0, 1.0, svgData);
             Rectangle b = template.getBounds();
             this.normMinX = b.x;
@@ -501,6 +505,14 @@ public class MapAnnotator extends AbstractConfigurable
             else if (key.equals("hkShapes")) hkShapes = (NamedKeyStroke) value;
             else if (key.equals("hkGum")) hkGum = (NamedKeyStroke) value;
             else if (key.equals("hkClear")) hkClear = (NamedKeyStroke) value;
+            return;
+        }
+        // VASSAL's AutoConfigurer passes Font OBJECTS from FontConfigurer when the
+        // designer edits the font; only module loading passes encoded strings.
+        // Font.toString() is not decodable, so without this branch the chosen
+        // font was silently dropped and the module kept saving SansSerif.
+        if (value instanceof Font) {
+            if (key.equals("font")) font = (Font) value;
             return;
         }
         String v = value.toString();
@@ -673,8 +685,11 @@ public class MapAnnotator extends AbstractConfigurable
         btnClear.addActionListener(e -> {
             if (multilayerDrawing) {
                 String activeId = (activeLayerId == null) ? NONE_LAYER_ID : activeLayerId;
+                // The None layer is implicit runtime state: it may legitimately be
+                // absent from the layers list (e.g. after setup(false) wiped it or
+                // in older saved games). Never abort Clear just because it is not
+                // in the list -- getLayerDisplayName(null) reports it as "None".
                 Layer active = getLayerById(activeId);
-                if (active == null) return;
                 if (!canModifyActiveLayer()) return;
                 String msg = "Clear all drawings on layer '" + getLayerDisplayName(active) + "'?";
                 if (JOptionPane.showConfirmDialog(map.getView(), msg, "Clear",
@@ -741,7 +756,13 @@ public class MapAnnotator extends AbstractConfigurable
 
     private void updateButtonStates() {
         boolean onNoneLayer = multilayerDrawing && (activeLayerId == null || activeLayerId.equals(NONE_LAYER_ID));
-        boolean canDraw = (onNoneLayer || canCurrentSideDraw()) && canModifyActiveLayer();
+        // With independent sides, "Can Draw" gates the SHARED None layer only.
+        // Sides with drawing disabled may still create and draw inside their
+        // OWN layers -- they just cannot draw on the shared None layer.
+        boolean canDraw;
+        if (multilayerDrawing && !onNoneLayer) canDraw = true;
+        else canDraw = canCurrentSideDraw();
+        canDraw = canDraw && canModifyActiveLayer();
         if (btnDraw != null) btnDraw.setEnabled(drawingEnabled && canDraw);
         if (btnText != null) btnText.setEnabled(textEnabled && canDraw);
         if (btnShapes != null) btnShapes.setEnabled(shapesEnabled && canDraw);
@@ -760,7 +781,9 @@ public class MapAnnotator extends AbstractConfigurable
     private void updateLayerButtonStates() {
         boolean canModify = canModifyActiveLayer();
         if (btnDeleteLayer != null) btnDeleteLayer.setEnabled(canModify && activeLayerId != null);
-        if (btnAddLayer != null) btnAddLayer.setEnabled(canCurrentSideDraw());
+        // Any side may create its own layers -- even sides with "Can Draw"
+        // disabled (they draw on their own layers, just not on None).
+        if (btnAddLayer != null) btnAddLayer.setEnabled(true);
     }
 
     private void refreshLayerCombo() {
@@ -1020,8 +1043,11 @@ public class MapAnnotator extends AbstractConfigurable
             if (multilayerDrawing && !canModifyActiveLayer()) return;
             if (!multilayerDrawing && independentSides && !canCurrentSideDraw()) return;
             if (multilayerDrawing && independentSides && !canCurrentSideDraw()) {
+                // Inverted permission: "Can Draw" gates the SHARED None layer
+                // only. Drawing-disabled sides may draw on their OWN layers
+                // but not on the shared None layer.
                 String activeId = (activeLayerId == null) ? NONE_LAYER_ID : activeLayerId;
-                if (!activeId.equals(NONE_LAYER_ID)) return;
+                if (activeId.equals(NONE_LAYER_ID)) return;
             }
             if (mode == Mode.DRAW) {
                 dragging = true;
@@ -1292,22 +1318,67 @@ public class MapAnnotator extends AbstractConfigurable
             int sep = def.indexOf('|');
             if (sep < 0) continue;
             String name = def.substring(0, sep).trim();
-            String svgData = def.substring(sep + 1).trim();
+            String rest = def.substring(sep + 1).trim();
+            // Optional placement-style suffix: "|D" = directed, absent = box.
+            boolean directed = false;
+            if (rest.endsWith("|D")) { directed = true; rest = rest.substring(0, rest.length() - 2).trim(); }
+            String svgData = rest;
             if (name.isEmpty() || svgData.isEmpty()) continue;
             try {
-                customShapesList.add(new CustomShape(name, svgData));
+                customShapesList.add(new CustomShape(name, svgData, directed));
             } catch (Exception ignored) {}
         }
     }
 
     private SvgPath createCustomShapePath(Point p1, Point p2, CustomShape cs, int rgb, double w) {
+        SvgPath sp = new SvgPath(UUID.randomUUID().toString(), rgb, w);
+
+        if (cs.directed) {
+            // Directed placement: p1 = tail, p2 = head. The shape is scaled
+            // uniformly so its width equals the tail->head distance, rotated
+            // to follow the drag direction, and centered on the midpoint.
+            double dx = p2.x - p1.x, dy = p2.y - p1.y;
+            double len = Math.hypot(dx, dy);
+            if (len < 1) return null;
+            double ang = Math.atan2(dy, dx);
+            double s = len / cs.normW;
+            double cxN = cs.normMinX + cs.normW / 2.0;
+            double cyN = cs.normMinY + cs.normH / 2.0;
+            double mx = (p1.x + p2.x) / 2.0, my = (p1.y + p2.y) / 2.0;
+            double ca = Math.cos(ang), sa = Math.sin(ang);
+
+            for (SvgPath.Subpath sub : cs.template.subs) {
+                double nx = (sub.startX - cxN) * s, ny = (sub.startY - cyN) * s;
+                SvgPath.Subpath newSub = new SvgPath.Subpath(mx + ca * nx - sa * ny, my + sa * nx + ca * ny);
+                for (SvgPath.Seg seg : sub.segs) {
+                    if (seg instanceof SvgPath.LineTo) {
+                        SvgPath.LineTo l = (SvgPath.LineTo) seg;
+                        double lx = (l.x - cxN) * s, ly = (l.y - cyN) * s;
+                        newSub.segs.add(new SvgPath.LineTo(mx + ca * lx - sa * ly, my + sa * lx + ca * ly));
+                    } else if (seg instanceof SvgPath.CubicTo) {
+                        SvgPath.CubicTo c = (SvgPath.CubicTo) seg;
+                        double a1x = (c.x1 - cxN) * s, a1y = (c.y1 - cyN) * s;
+                        double a2x = (c.x2 - cxN) * s, a2y = (c.y2 - cyN) * s;
+                        double a3x = (c.x - cxN) * s, a3y = (c.y - cyN) * s;
+                        newSub.segs.add(new SvgPath.CubicTo(
+                                mx + ca * a1x - sa * a1y, my + sa * a1x + ca * a1y,
+                                mx + ca * a2x - sa * a2y, my + sa * a2x + ca * a2y,
+                                mx + ca * a3x - sa * a3y, my + sa * a3x + ca * a3y));
+                    }
+                }
+                sp.subs.add(newSub);
+            }
+            sp.invalidateBounds();
+            return sp;
+        }
+
+        // Box placement (default): corner-to-corner, screen-aligned.
         double bx = Math.min(p1.x, p2.x);
         double by = Math.min(p1.y, p2.y);
         double bw = Math.abs(p1.x - p2.x);
         double bh = Math.abs(p1.y - p2.y);
         if (bw < 1 || bh < 1) return null;
 
-        SvgPath sp = new SvgPath(UUID.randomUUID().toString(), rgb, w);
         for (SvgPath.Subpath sub : cs.template.subs) {
             double sx = bx + ((sub.startX - cs.normMinX) / cs.normW) * bw;
             double sy = by + ((sub.startY - cs.normMinY) / cs.normH) * bh;
@@ -1466,7 +1537,16 @@ public class MapAnnotator extends AbstractConfigurable
             if (map != null) map.repaint();
         }
         if (gameStarting) {
-            SwingUtilities.invokeLater(() -> updateButtonStates());
+            // The None layer is implicit runtime state (not stored in saved games):
+            // always re-create it on game start so drawing/clearing on "None"
+            // works even when the saved state contains no layers at all.
+            if (multilayerDrawing) {
+                ensureNoneLayer();
+            }
+            SwingUtilities.invokeLater(() -> {
+                if (multilayerDrawing) refreshLayerCombo();
+                updateButtonStates();
+            });
         }
     }
 
@@ -2080,25 +2160,27 @@ public class MapAnnotator extends AbstractConfigurable
 
     private Color getEffectiveDrawColor() {
         if (independentSides) {
-            // Use main drawColor when on None layer
-            String activeId = (activeLayerId == null) ? NONE_LAYER_ID : activeLayerId;
-            if (multilayerDrawing && activeId.equals(NONE_LAYER_ID)) return drawColor;
+            // Side colors apply everywhere -- including the None layer.
+            // (Drawings on the None layer are still tagged with the drawing
+            // side, so it would be inconsistent to use the global color there.
+            // The old early-return here made per-side colors look broken
+            // whenever multilayer drawing was enabled, because "None" is the
+            // default active layer.)
             String mySide = getMySideOrEmpty();
             SideSetting ss = getSideSetting(mySide);
-            if (ss != null) return ss.drawColor;
+            if (ss != null && ss.drawColor != null) return ss.drawColor;
         }
         return drawColor;
     }
 
     private Color getEffectiveTextColor() {
         if (independentSides) {
-            // Use main textColor when on None layer
-            String activeId = (activeLayerId == null) ? NONE_LAYER_ID : activeLayerId;
-            if (multilayerDrawing && activeId.equals(NONE_LAYER_ID)) return textColor;
+            // Side colors apply everywhere -- including the None layer (see
+            // getEffectiveDrawColor above).
             String mySide = getMySideOrEmpty();
             SideSetting ss = getSideSetting(mySide);
             if (ss != null && ss.textColor != null) return ss.textColor;
-            if (ss != null) return ss.drawColor;
+            if (ss != null && ss.drawColor != null) return ss.drawColor;
         }
         return textColor;
     }
@@ -2165,14 +2247,474 @@ public class MapAnnotator extends AbstractConfigurable
         catch (Exception e) { return ""; }
     }
 
+    // ------------------- SVG Flattener (pure JDK, no external deps) -------------------
+
+    /**
+     * Flattens a real .svg file (paths, rects, circles, ellipses, polygons,
+     * polylines, lines, nested groups with transforms) into the absolute
+     * "M x y L x y C ... Z" path data used by Custom Shapes.
+     *
+     * Pure JDK: DOM parsing via javax.xml.parsers, path-data / transform
+     * parsing implemented here. Arcs and quadratic beziers are converted to
+     * cubics; relative commands are converted to absolute. Fills are ignored
+     * (the annotator strokes outlines only).
+     */
+    private static class SvgFlattener {
+
+        private static final double K = 0.5522847498307936; // circle->bezier constant
+
+        // ---------- transforms: {a,b,c,d,e,f} ----------
+        private static double[] identity() { return new double[]{1, 0, 0, 1, 0, 0}; }
+
+        private static double[] compose(double[] outer, double[] inner) {
+            // returns outer . inner  (apply inner first, then outer)
+            double a = outer[0] * inner[0] + outer[2] * inner[1];
+            double b = outer[1] * inner[0] + outer[3] * inner[1];
+            double c = outer[0] * inner[2] + outer[2] * inner[3];
+            double d = outer[1] * inner[2] + outer[3] * inner[3];
+            double e = outer[0] * inner[4] + outer[2] * inner[5] + outer[4];
+            double f = outer[1] * inner[4] + outer[3] * inner[5] + outer[5];
+            return new double[]{a, b, c, d, e, f};
+        }
+
+        private static double[] apply(double[] m, double x, double y) {
+            return new double[]{m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]};
+        }
+
+        static double[] parseTransform(String text) {
+            double[] m = identity();
+            if (text == null || text.trim().isEmpty()) return m;
+            java.util.regex.Matcher fm = java.util.regex.Pattern
+                    .compile("(translate|scale|rotate|matrix|skewX|skewY)\\s*\\(([^)]*)\\)")
+                    .matcher(text);
+            while (fm.find()) {
+                String name = fm.group(1);
+                java.util.List<Double> args = new java.util.ArrayList<>();
+                java.util.regex.Matcher nm = java.util.regex.Pattern
+                        .compile("[-+]?[\\d.]+(?:[eE][-+]?\\d+)?").matcher(fm.group(2));
+                while (nm.find()) args.add(Double.parseDouble(nm.group()));
+                double[] t = identity();
+                switch (name) {
+                    case "translate": {
+                        double tx = args.size() > 0 ? args.get(0) : 0;
+                        double ty = args.size() > 1 ? args.get(1) : 0;
+                        t = new double[]{1, 0, 0, 1, tx, ty};
+                        break;
+                    }
+                    case "scale": {
+                        double sx = args.size() > 0 ? args.get(0) : 1;
+                        double sy = args.size() > 1 ? args.get(1) : sx;
+                        t = new double[]{sx, 0, 0, sy, 0, 0};
+                        break;
+                    }
+                    case "rotate": {
+                        double ang = Math.toRadians(args.size() > 0 ? args.get(0) : 0);
+                        double ca = Math.cos(ang), sa = Math.sin(ang);
+                        t = new double[]{ca, sa, -sa, ca, 0, 0};
+                        if (args.size() >= 3) {
+                            double cx = args.get(1), cy = args.get(2);
+                            t = compose(compose(new double[]{1, 0, 0, 1, cx, cy}, t),
+                                    new double[]{1, 0, 0, 1, -cx, -cy});
+                        }
+                        break;
+                    }
+                    case "matrix": {
+                        if (args.size() >= 6)
+                            t = new double[]{args.get(0), args.get(1), args.get(2), args.get(3), args.get(4), args.get(5)};
+                        break;
+                    }
+                    case "skewX": {
+                        t = new double[]{1, 0, Math.tan(Math.toRadians(args.get(0))), 1, 0, 0};
+                        break;
+                    }
+                    case "skewY": {
+                        t = new double[]{1, Math.tan(Math.toRadians(args.get(0))), 0, 1, 0, 0};
+                        break;
+                    }
+                }
+                m = compose(t, m);
+            }
+            return m;
+        }
+
+        // ---------- path data parsing ----------
+        private static java.util.List<Object> tokenize(String d) {
+            java.util.List<Object> toks = new java.util.ArrayList<>();
+            int i = 0;
+            final int n = d.length();
+            while (i < n) {
+                char ch = d.charAt(i);
+                if (Character.isWhitespace(ch) || ch == ',') { i++; continue; }
+                if (Character.isLetter(ch)) { toks.add(String.valueOf(ch)); i++; continue; }
+                int start = i;
+                if (ch == '+' || ch == '-') i++;
+                while (i < n && (Character.isDigit(d.charAt(i)) || d.charAt(i) == '.')) i++;
+                if (i < n && (d.charAt(i) == 'e' || d.charAt(i) == 'E')) {
+                    i++;
+                    if (i < n && (d.charAt(i) == '+' || d.charAt(i) == '-')) i++;
+                    while (i < n && Character.isDigit(d.charAt(i))) i++;
+                }
+                if (i == start) throw new IllegalArgumentException("Bad character in path data at " + i);
+                toks.add(Double.parseDouble(d.substring(start, i)));
+            }
+            return toks;
+        }
+
+        private static String fmt(double v) {
+            double r = Math.round(v);
+            if (Math.abs(v - r) < 1e-9) return Long.toString((long) r);
+            String s = String.format(Locale.US, "%.4f", v);
+            while (s.indexOf('.') >= 0 && s.endsWith("0")) s = s.substring(0, s.length() - 1);
+            if (s.endsWith(".")) s = s.substring(0, s.length() - 1);
+            return s;
+        }
+
+        /** Parses one path 'd' string; emits absolute M/L/C/Z with transform applied. */
+        static void parsePathData(String d, double[] m, StringBuilder out) {
+            java.util.List<Object> toks = tokenize(d);
+            int[] idx = {0};
+            final int n = toks.size();
+
+            char cmd = 0;
+            double cx = 0, cy = 0, sx = 0, sy = 0;
+            double[] prevC2 = null, prevQc = null;
+            boolean started = false;
+
+            while (idx[0] < n) {
+                Object o = toks.get(idx[0]);
+                if (o instanceof String) { cmd = ((String) o).charAt(0); idx[0]++; }
+                if (cmd == 0) throw new IllegalArgumentException("Path data must begin with a command");
+
+                boolean rel = Character.isLowerCase(cmd);
+                char C = Character.toUpperCase(cmd);
+
+                if (C == 'M') {
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { x += cx; y += cy; }
+                    emit(out, m, 'M', x, y, 0, 0, 0, 0, 2);
+                    cx = x; cy = y; sx = x; sy = y;
+                    started = true; prevC2 = prevQc = null;
+                    cmd = rel ? 'l' : 'L';
+                } else if (C == 'L') {
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { x += cx; y += cy; }
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emit(out, m, 'L', x, y, 0, 0, 0, 0, 2);
+                    cx = x; cy = y; prevC2 = prevQc = null;
+                } else if (C == 'H') {
+                    double x = take(toks, idx);
+                    if (rel) x += cx;
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emit(out, m, 'L', x, cy, 0, 0, 0, 0, 2);
+                    cx = x; prevC2 = prevQc = null;
+                } else if (C == 'V') {
+                    double y = take(toks, idx);
+                    if (rel) y += cy;
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emit(out, m, 'L', cx, y, 0, 0, 0, 0, 2);
+                    cy = y; prevC2 = prevQc = null;
+                } else if (C == 'C') {
+                    double x1 = take(toks, idx), y1 = take(toks, idx);
+                    double x2 = take(toks, idx), y2 = take(toks, idx);
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { x1 += cx; y1 += cy; x2 += cx; y2 += cy; x += cx; y += cy; }
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emit(out, m, 'C', x1, y1, x2, y2, x, y, 6);
+                    cx = x; cy = y; prevC2 = new double[]{x2, y2}; prevQc = null;
+                } else if (C == 'S') {
+                    double x2 = take(toks, idx), y2 = take(toks, idx);
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { x2 += cx; y2 += cy; x += cx; y += cy; }
+                    double x1, y1;
+                    if (prevC2 == null) { x1 = cx; y1 = cy; }
+                    else { x1 = 2 * cx - prevC2[0]; y1 = 2 * cy - prevC2[1]; }
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emit(out, m, 'C', x1, y1, x2, y2, x, y, 6);
+                    cx = x; cy = y; prevC2 = new double[]{x2, y2}; prevQc = null;
+                } else if (C == 'Q') {
+                    double qx = take(toks, idx), qy = take(toks, idx);
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { qx += cx; qy += cy; x += cx; y += cy; }
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emitQuad(out, m, cx, cy, qx, qy, x, y);
+                    cx = x; cy = y; prevQc = new double[]{qx, qy}; prevC2 = null;
+                } else if (C == 'T') {
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { x += cx; y += cy; }
+                    double qx, qy;
+                    if (prevQc == null) { qx = cx; qy = cy; }
+                    else { qx = 2 * cx - prevQc[0]; qy = 2 * cy - prevQc[1]; }
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    emitQuad(out, m, cx, cy, qx, qy, x, y);
+                    cx = x; cy = y; prevQc = new double[]{qx, qy}; prevC2 = null;
+                } else if (C == 'A') {
+                    double rx = take(toks, idx), ry = take(toks, idx), rot = take(toks, idx);
+                    double laf = take(toks, idx), sf = take(toks, idx);
+                    double x = take(toks, idx), y = take(toks, idx);
+                    if (rel) { x += cx; y += cy; }
+                    if (!started) { emit(out, m, 'M', cx, cy, 0, 0, 0, 0, 2); started = true; }
+                    for (double[][] seg : arcToCubics(cx, cy, rx, ry, rot, laf > 0.5, sf > 0.5, x, y)) {
+                        emit(out, m, 'C', seg[0][0], seg[0][1], seg[1][0], seg[1][1], seg[2][0], seg[2][1], 6);
+                    }
+                    cx = x; cy = y; prevC2 = prevQc = null;
+                } else if (C == 'Z') {
+                    if (started) { out.append("Z "); started = false; }
+                    cx = sx; cy = sy; prevC2 = prevQc = null;
+                } else {
+                    throw new IllegalArgumentException("Unsupported path command: " + cmd);
+                }
+            }
+        }
+
+        private static double take(java.util.List<Object> toks, int[] idx) {
+            if (idx[0] >= toks.size() || toks.get(idx[0]) instanceof String)
+                throw new IllegalArgumentException("Missing parameters for path command");
+            return (Double) toks.get(idx[0]++);
+        }
+
+        private static void emit(StringBuilder out, double[] m, char cmd,
+                                 double x1, double y1, double x2, double y2, double x, double y, int nCoords) {
+            double[] p1 = apply(m, x1, y1);
+            double[] p2 = apply(m, x2, y2);
+            double[] p3 = apply(m, x, y);
+            out.append(cmd);
+            if (nCoords >= 2) out.append(' ').append(fmt(p1[0])).append(' ').append(fmt(p1[1]));
+            if (nCoords >= 6) out.append(' ').append(fmt(p2[0])).append(' ').append(fmt(p2[1]))
+                    .append(' ').append(fmt(p3[0])).append(' ').append(fmt(p3[1]));
+            out.append(' ');
+        }
+
+        private static void emitQuad(StringBuilder out, double[] m,
+                                     double cx, double cy, double qx, double qy, double x, double y) {
+            double c1x = cx + 2.0 / 3.0 * (qx - cx);
+            double c1y = cy + 2.0 / 3.0 * (qy - cy);
+            double c2x = x + 2.0 / 3.0 * (qx - x);
+            double c2y = y + 2.0 / 3.0 * (qy - y);
+            emit(out, m, 'C', c1x, c1y, c2x, c2y, x, y, 6);
+        }
+
+        /** SVG elliptical arc -> cubic bezier segments (endpoint parameterization). */
+        private static java.util.List<double[][]> arcToCubics(double x1, double y1,
+                double rx, double ry, double xrot, boolean largeArc, boolean sweep, double x2, double y2) {
+            java.util.List<double[][]> segs = new java.util.ArrayList<>();
+            if (rx == 0 || ry == 0 || (x1 == x2 && y1 == y2)) return segs;
+            rx = Math.abs(rx); ry = Math.abs(ry);
+            double phi = Math.toRadians(xrot % 360);
+            double cosp = Math.cos(phi), sinp = Math.sin(phi);
+
+            double dx2 = (x1 - x2) / 2.0, dy2 = (y1 - y2) / 2.0;
+            double x1p = cosp * dx2 + sinp * dy2;
+            double y1p = -sinp * dx2 + cosp * dy2;
+
+            double lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+            if (lam > 1.0) { double s = Math.sqrt(lam); rx *= s; ry *= s; }
+
+            double num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+            double den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+            if (den == 0) return segs;
+            double co = Math.sqrt(Math.max(0.0, num / den));
+            if (largeArc == sweep) co = -co;
+            double cxp = co * rx * y1p / ry;
+            double cyp = -co * ry * x1p / rx;
+            double cx = cosp * cxp - sinp * cyp + (x1 + x2) / 2.0;
+            double cy = sinp * cxp + cosp * cyp + (y1 + y2) / 2.0;
+
+            double theta1 = angleBetween(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+            double dtheta = angleBetween((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+            if (!sweep && dtheta > 0) dtheta -= 2 * Math.PI;
+            if (sweep && dtheta < 0) dtheta += 2 * Math.PI;
+
+            int nseg = Math.max(1, (int) Math.ceil(Math.abs(dtheta) / (Math.PI / 2.0) - 1e-9));
+            double delta = dtheta / nseg;
+            double k = 4.0 / 3.0 * Math.tan(delta / 4.0);
+
+            double th = theta1, px = x1, py = y1;
+            for (int s = 0; s < nseg; s++) {
+                double th2 = th + delta;
+                double c1v = Math.cos(th), s1v = Math.sin(th);
+                double c2v = Math.cos(th2), s2v = Math.sin(th2);
+                double[] e = ellipsePt(rx, ry, cosp, sinp, cx, cy, c2v, s2v);
+                double[] d1 = ellipseDeriv(rx, ry, cosp, sinp, c1v, s1v);
+                double[] d2 = ellipseDeriv(rx, ry, cosp, sinp, c2v, s2v);
+                double l1 = Math.hypot(d1[0], d1[1]); if (l1 == 0) l1 = 1;
+                double l2 = Math.hypot(d2[0], d2[1]); if (l2 == 0) l2 = 1;
+                segs.add(new double[][]{
+                        {px + k * d1[0] / l1, py + k * d1[1] / l1},
+                        {e[0] - k * d2[0] / l2, e[1] - k * d2[1] / l2},
+                        {e[0], e[1]}});
+                px = e[0]; py = e[1];
+                th = th2;
+            }
+            return segs;
+        }
+
+        private static double angleBetween(double ux, double uy, double vx, double vy) {
+            double dot = ux * vx + uy * vy;
+            double ln = Math.sqrt(ux * ux + uy * uy) * Math.sqrt(vx * vx + vy * vy);
+            double a = ln == 0 ? 0 : Math.acos(Math.max(-1.0, Math.min(1.0, dot / ln)));
+            if (ux * vy - uy * vx < 0) a = -a;
+            return a;
+        }
+
+        private static double[] ellipsePt(double rx, double ry, double cosp, double sinp,
+                                          double cx, double cy, double cosv, double sinv) {
+            double ex = rx * cosv, ey = ry * sinv;
+            return new double[]{cosp * ex - sinp * ey + cx, sinp * ex + cosp * ey + cy};
+        }
+
+        private static double[] ellipseDeriv(double rx, double ry, double cosp, double sinp,
+                                             double cosv, double sinv) {
+            double dxu = -rx * sinv, dyu = ry * cosv;
+            return new double[]{cosp * dxu - sinp * dyu, sinp * dxu + cosp * dyu};
+        }
+
+        // ---------- basic shapes ----------
+        private static void shapeRect(double x, double y, double w, double h,
+                                      double rx, double ry, double[] m, StringBuilder out) {
+            rx = Math.min(Math.max(rx, 0), w / 2.0);
+            ry = Math.min(Math.max(ry, 0), h / 2.0);
+            if (rx <= 0 || ry <= 0) {
+                emit(out, m, 'M', x, y, 0, 0, 0, 0, 2);
+                emit(out, m, 'L', x + w, y, 0, 0, 0, 0, 2);
+                emit(out, m, 'L', x + w, y + h, 0, 0, 0, 0, 2);
+                emit(out, m, 'L', x, y + h, 0, 0, 0, 0, 2);
+                emit(out, m, 'L', x, y, 0, 0, 0, 0, 2);
+            } else {
+                double kx = rx * K, ky = ry * K;
+                emit(out, m, 'M', x + rx, y, 0, 0, 0, 0, 2);
+                emit(out, m, 'L', x + w - rx, y, 0, 0, 0, 0, 2);
+                emit(out, m, 'C', x + w - rx + kx, y, x + w, y + ry, x + w, y + ry, 6);
+                emit(out, m, 'L', x + w, y + h - ry, 0, 0, 0, 0, 2);
+                emit(out, m, 'C', x + w, y + h - ry + ky, x + w - rx, y + h, x + w - rx, y + h, 6);
+                emit(out, m, 'L', x + rx, y + h, 0, 0, 0, 0, 2);
+                emit(out, m, 'C', x + rx - kx, y + h, x, y + h - ry, x, y + h - ry, 6);
+                emit(out, m, 'L', x, y + ry, 0, 0, 0, 0, 2);
+                emit(out, m, 'C', x, y + ry - ky, x + rx, y, x + rx, y, 6);
+            }
+            out.append("Z ");
+        }
+
+        private static void shapeEllipse(double cx, double cy, double rx, double ry,
+                                         double[] m, StringBuilder out) {
+            if (rx <= 0 || ry <= 0) return;
+            double kx = rx * K, ky = ry * K;
+            emit(out, m, 'M', cx + rx, cy, 0, 0, 0, 0, 2);
+            emit(out, m, 'C', cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry, 6);
+            emit(out, m, 'C', cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy, 6);
+            emit(out, m, 'C', cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry, 6);
+            emit(out, m, 'C', cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy, 6);
+            out.append("Z ");
+        }
+
+        private static void shapePolygon(String points, boolean close, double[] m, StringBuilder out) {
+            if (points == null) return;
+            java.util.List<Double> nums = new java.util.ArrayList<>();
+            java.util.regex.Matcher nm = java.util.regex.Pattern
+                    .compile("[-+]?[\\d.]+(?:[eE][-+]?\\d+)?").matcher(points);
+            while (nm.find()) nums.add(Double.parseDouble(nm.group()));
+            if (nums.size() < 4) return;
+            emit(out, m, 'M', nums.get(0), nums.get(1), 0, 0, 0, 0, 2);
+            for (int j = 2; j + 1 < nums.size(); j += 2)
+                emit(out, m, 'L', nums.get(j), nums.get(j + 1), 0, 0, 0, 0, 2);
+            if (close) out.append("Z ");
+        }
+
+        // ---------- document walk ----------
+        private static String localName(org.w3c.dom.Node n) {
+            String name = n.getNodeName();
+            int i = name.indexOf(':');
+            return i >= 0 ? name.substring(i + 1) : name;
+        }
+
+        private static double attr(org.w3c.dom.Element el, String name, double def) {
+            String v = el.getAttribute(name);
+            if (v == null || v.trim().isEmpty()) return def;
+            try { return Double.parseDouble(v.trim()); } catch (NumberFormatException e) { return def; }
+        }
+
+        private static void walk(org.w3c.dom.Element el, double[] m, StringBuilder out) {
+            String tag = localName(el);
+            String tr = el.getAttribute("transform");
+            if (tr != null && !tr.trim().isEmpty()) m = compose(parseTransform(tr), m);
+
+            if (tag.equals("g") || tag.equals("svg") || tag.equals("a")) {
+                org.w3c.dom.NodeList children = el.getChildNodes();
+                for (int i = 0; i < children.getLength(); i++) {
+                    org.w3c.dom.Node c = children.item(i);
+                    if (c instanceof org.w3c.dom.Element) walk((org.w3c.dom.Element) c, m, out);
+                }
+                return;
+            }
+            if (tag.equals("defs") || tag.equals("symbol") || tag.equals("clipPath")
+                    || tag.equals("mask") || tag.equals("marker") || tag.equals("metadata")
+                    || tag.equals("text") || tag.equals("tspan") || tag.equals("use")
+                    || tag.equals("style") || tag.equals("title") || tag.equals("desc")) {
+                return;
+            }
+
+            try {
+                if (tag.equals("path")) {
+                    String d = el.getAttribute("d");
+                    if (d != null && !d.trim().isEmpty()) parsePathData(d, m, out);
+                } else if (tag.equals("rect")) {
+                    double x = attr(el, "x", 0), y = attr(el, "y", 0);
+                    double w = attr(el, "width", 0), h = attr(el, "height", 0);
+                    if (w > 0 && h > 0) {
+                        double rx = attr(el, "rx", attr(el, "r", 0));
+                        double ry = attr(el, "ry", attr(el, "r", 0));
+                        if (rx == 0 && ry > 0) rx = ry;
+                        if (ry == 0 && rx > 0) ry = rx;
+                        shapeRect(x, y, w, h, rx, ry, m, out);
+                    }
+                } else if (tag.equals("circle")) {
+                    double r = attr(el, "r", 0);
+                    if (r > 0) shapeEllipse(attr(el, "cx", 0), attr(el, "cy", 0), r, r, m, out);
+                } else if (tag.equals("ellipse")) {
+                    double rx = attr(el, "rx", 0), ry = attr(el, "ry", 0);
+                    if (rx > 0 && ry > 0) shapeEllipse(attr(el, "cx", 0), attr(el, "cy", 0), rx, ry, m, out);
+                } else if (tag.equals("line")) {
+                    emit(out, m, 'M', attr(el, "x1", 0), attr(el, "y1", 0), 0, 0, 0, 0, 2);
+                    emit(out, m, 'L', attr(el, "x2", 0), attr(el, "y2", 0), 0, 0, 0, 0, 2);
+                } else if (tag.equals("polygon")) {
+                    shapePolygon(el.getAttribute("points"), true, m, out);
+                } else if (tag.equals("polyline")) {
+                    shapePolygon(el.getAttribute("points"), false, m, out);
+                }
+            } catch (RuntimeException ex) {
+                System.err.println("MapAnnotator: skipping <" + tag + "> during SVG import: " + ex);
+            }
+        }
+
+        /** Flattens a .svg file into absolute M/L/C/Z path data; "" if nothing convertible. */
+        static String flatten(java.io.File file) throws Exception {
+            javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+            dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            javax.xml.parsers.DocumentBuilder db = dbf.newDocumentBuilder();
+            org.w3c.dom.Document doc = db.parse(file);
+            StringBuilder out = new StringBuilder();
+            walk(doc.getDocumentElement(), identity(), out);
+            return out.toString().trim();
+        }
+    }
+
     // ------------------- Configurer Factories -------------------
 
     /** Factory for the font picker (family + size in one widget). */
     public static class FontConfig implements ConfigurerFactory {
         @Override
         public Configurer getConfigurer(AutoConfigurable c, String key, String name) {
+            // Seed the picker with the component's CURRENT font so reopening
+            // the editor shows what was saved instead of always SansSerif 20.
+            Font current = null;
+            try {
+                String enc = c == null ? null : c.getAttributeValueString(key);
+                if (enc != null && !enc.trim().isEmpty()) current = FontConfigurer.decode(enc);
+            } catch (Exception ignored) {}
+            if (current == null) current = new Font("SansSerif", Font.PLAIN, 20);
             return new FontConfigurer(key, name,
-                new Font("SansSerif", Font.PLAIN, 20),
+                current,
                 new int[]{8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64});
         }
     }
@@ -2384,7 +2926,7 @@ public class MapAnnotator extends AbstractConfigurable
         private javax.swing.JTable table;
         private javax.swing.table.DefaultTableModel model;
 
-        public CustomShapesConfigurer(String key, String name) {
+        CustomShapesConfigurer(String key, String name) {
             super(key, name);
         }
 
@@ -2404,7 +2946,8 @@ public class MapAnnotator extends AbstractConfigurable
             if (controls == null) {
                 controls = new JPanel(new BorderLayout(5, 5));
 
-                model = new javax.swing.table.DefaultTableModel(new Object[]{"Name", "SVG Path Data"}, 0) {
+                model = new javax.swing.table.DefaultTableModel(
+                    new Object[]{"Name", "SVG Path Data", "Placement"}, 0) {
                     @Override
                     public boolean isCellEditable(int row, int col) {
                         return true;
@@ -2414,16 +2957,23 @@ public class MapAnnotator extends AbstractConfigurable
                 table = new javax.swing.JTable(model);
                 table.setRowHeight(22);
                 table.putClientProperty("terminateEditOnFocusLost", Boolean.TRUE);
+                // Placement column: dropdown Box / Directed
+                table.getColumnModel().getColumn(2).setCellRenderer(new javax.swing.table.DefaultTableCellRenderer());
+                String[] placements = {"Box", "Directed"};
+                javax.swing.JComboBox<String> placeCombo = new javax.swing.JComboBox<>(placements);
+                table.getColumnModel().getColumn(2).setCellEditor(new javax.swing.DefaultCellEditor(placeCombo));
 
                 javax.swing.JScrollPane scroll = new javax.swing.JScrollPane(table);
-                scroll.setPreferredSize(new java.awt.Dimension(400, 100));
+                scroll.setPreferredSize(new java.awt.Dimension(400, 120));
                 controls.add(scroll, BorderLayout.CENTER);
 
                 JPanel buttonPanel = new JPanel();
                 JButton addBtn = new JButton("Add Shape");
                 JButton removeBtn = new JButton("Remove Shape");
+                JButton importBtn = new JButton("Import from file...");
+                importBtn.setToolTipText("Import rows from a Name|path text file, or flatten real .svg files (path/rect/circle/ellipse/polygon/groups/transforms)");
                 addBtn.addActionListener(e -> {
-                    model.addRow(new Object[]{"", ""});
+                    model.addRow(new Object[]{"", "", "Box"});
                 });
                 removeBtn.addActionListener(e -> {
                     int sel = table.getSelectedRow();
@@ -2431,14 +2981,16 @@ public class MapAnnotator extends AbstractConfigurable
                         model.removeRow(sel);
                     }
                 });
+                importBtn.addActionListener(e -> importFromFile());
                 buttonPanel.add(addBtn);
                 buttonPanel.add(removeBtn);
+                buttonPanel.add(importBtn);
                 controls.add(buttonPanel, BorderLayout.SOUTH);
 
                 // Populate from current value
                 model.setRowCount(0);
                 for (String[] row : rows) {
-                    model.addRow(new Object[]{row[0], row[1]});
+                    model.addRow(new Object[]{row[0], row[1], "D".equals(row[2]) ? "Directed" : "Box"});
                 }
 
                 // Fire update when table changes
@@ -2450,15 +3002,79 @@ public class MapAnnotator extends AbstractConfigurable
                         for (int i = 0; i < model.getRowCount(); i++) {
                             String n = (String) model.getValueAt(i, 0);
                             String p = (String) model.getValueAt(i, 1);
+                            String pl = model.getValueAt(i, 2) instanceof String ? (String) model.getValueAt(i, 2) : "Box";
                             if (n == null) n = "";
                             if (p == null) p = "";
-                            rows.add(new String[]{n, p});
+                            rows.add(new String[]{n, p, "Directed".equals(pl) ? "D" : ""});
                         }
                         setValue((Object) encodeRows());
                     }
                 });
             }
             return controls;
+        }
+
+        /**
+         * Import shapes from one or more files:
+         *  - .txt / .path / .csv: lines of "Name|pathData" (optionally "Name|path|D"),
+         *    e.g. produced by the external svg_to_path.py converter.
+         *  - .svg: real SVG files, flattened natively by SvgFlattener into
+         *    absolute M/L/C/Z path data. Shape name defaults to the filename.
+         */
+        private void importFromFile() {
+            javax.swing.JFileChooser fc = new javax.swing.JFileChooser();
+            fc.setMultiSelectionEnabled(true);
+            fc.setDialogTitle("Import Custom Shapes (SVG path text or real .svg files)");
+            fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                "SVG / path text (svg, txt, path, csv)", "svg", "txt", "path", "csv"));
+            if (fc.showOpenDialog(controls) != javax.swing.JFileChooser.APPROVE_OPTION) return;
+
+            java.util.List<String[]> imported = new java.util.ArrayList<>();
+            int failed = 0;
+            for (java.io.File f : fc.getSelectedFiles()) {
+                String lower = f.getName().toLowerCase(Locale.US);
+                try {
+                    if (lower.endsWith(".svg")) {
+                        String data = SvgFlattener.flatten(f);
+                        if (data == null || data.trim().isEmpty()) {
+                            failed++;
+                            continue;
+                        }
+                        String name = f.getName();
+                        int dot = name.lastIndexOf('.');
+                        if (dot > 0) name = name.substring(0, dot);
+                        imported.add(new String[]{name, data.trim(), ""});
+                    } else {
+                        for (String line : new String(java.nio.file.Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8).split("\n")) {
+                            line = line.trim();
+                            if (line.isEmpty() || line.startsWith("#")) continue;
+                            int sep = line.indexOf('|');
+                            if (sep < 0) continue;
+                            String name = line.substring(0, sep).trim();
+                            String rest = line.substring(sep + 1).trim();
+                            String placement = "";
+                            if (rest.endsWith("|D")) { placement = "D"; rest = rest.substring(0, rest.length() - 2).trim(); }
+                            if (!name.isEmpty() && !rest.isEmpty())
+                                imported.add(new String[]{name, rest, placement});
+                        }
+                    }
+                } catch (Exception ex) {
+                    failed++;
+                    System.err.println("MapAnnotator: import failed for " + f.getName() + ": " + ex);
+                }
+            }
+
+            if (imported.isEmpty()) {
+                JOptionPane.showMessageDialog(controls,
+                    "No convertible shapes found in the selected file(s).",
+                    "Import Custom Shapes", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            for (String[] row : imported) {
+                model.addRow(new Object[]{row[0], row[1], "D".equals(row[2]) ? "Directed" : "Box"});
+            }
+            String msg = "Imported " + imported.size() + " shape(s)" + (failed > 0 ? " (" + failed + " file(s) failed)" : "") + ".";
+            JOptionPane.showMessageDialog(controls, msg, "Import Custom Shapes", JOptionPane.INFORMATION_MESSAGE);
         }
 
         private void parseRows(String s) {
@@ -2468,9 +3084,13 @@ public class MapAnnotator extends AbstractConfigurable
                 if (def == null || def.trim().isEmpty()) continue;
                 int sep = def.indexOf('|');
                 if (sep < 0) {
-                    rows.add(new String[]{def.trim(), ""});
+                    rows.add(new String[]{def.trim(), "", ""});
                 } else {
-                    rows.add(new String[]{def.substring(0, sep).trim(), def.substring(sep + 1).trim()});
+                    String name = def.substring(0, sep).trim();
+                    String rest = def.substring(sep + 1).trim();
+                    String placement = "";
+                    if (rest.endsWith("|D")) { placement = "D"; rest = rest.substring(0, rest.length() - 2).trim(); }
+                    rows.add(new String[]{name, rest, placement});
                 }
             }
         }
@@ -2480,11 +3100,13 @@ public class MapAnnotator extends AbstractConfigurable
             for (int i = 0; i < rows.size(); i++) {
                 String n = rows.get(i)[0];
                 String p = rows.get(i)[1];
+                String d = rows.get(i).length > 2 ? rows.get(i)[2] : "";
                 if (n == null) n = "";
                 if (p == null) p = "";
                 if (n.isEmpty() && p.isEmpty()) continue;
                 if (sb.length() > 0) sb.append("||");
                 sb.append(n).append("|").append(p);
+                if ("D".equals(d)) sb.append("|D");
             }
             return sb.toString();
         }
